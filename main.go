@@ -5,6 +5,8 @@ import (
 	"log"
 	"os"
 	"io"
+	"strconv"
+	"strings"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -16,6 +18,12 @@ const(
 	tmpDir = "/tmp/magneto-files"
 )
 
+func UrlToRetrievalPath(url url.URL) string {
+	return strings.Replace(url.Path[1:], "/", "-", -1)
+}
+
+///////////////////////////////////////////////////
+
 type Metadata struct {
 	ContentType string
 	RetrievalPath string
@@ -24,6 +32,7 @@ type Metadata struct {
 type MetadataStore interface {
 	Get(key string) (Metadata, error) 
 	Set(key string, metadata Metadata) error
+	Exists(key string) (bool, error)
 }
 
 type RedisStore struct {
@@ -45,11 +54,17 @@ func (rs *RedisStore) Set(key string, metadata Metadata) error {
 	}
 	return rs.client.HMSet(key, metaMap).Err()
 }
+
+func (rs *RedisStore) Exists(key string) (bool, error) {
+	exists, err := rs.client.Exists(key).Result()
+	return exists, err
+}
+
 ///////////////////////////////////////////////////////////////////////////
 
 type BinaryStore interface {
-	Get(retrievalPath string) (io.Reader, error)
-	Set(retrievalPath string, r io.Reader) error
+	Get(retrievalPath string) (io.ReadCloser, int64, error)
+	Set(retrievalPath string, r io.ReadCloser) error
 }
 
 type FileStore struct {
@@ -63,29 +78,27 @@ func NewFileStore() *FileStore {
 	}
 }
 
-func (fs *FileStore) Get(retrievalPath string) (io.Reader, error) {
+func (fs *FileStore) Get(retrievalPath string) (io.ReadCloser, int64, error) {
 	file, err := os.Open(fs.Directory + "/" + retrievalPath)
 	if err != nil {
-		log.Fatal(err)
-		return nil, err
+		log.Println(err)
 	}
-
-	return file, nil
+	fileInfo, _ := file.Stat()
+	
+	return file, fileInfo.Size(), err
 }
 
-func (fs *FileStore) Set(retrievalPath string, r io.Reader) error {
-	file, err := os.Create(fs.Directory + "/" + retrievalPath)
+func (fs *FileStore) Set(RetrievalPath string, r io.ReadCloser) error {
+	file, err := os.Create(fs.Directory + "/" + RetrievalPath)
 	defer file.Close()
+	defer r.Close()
 	if err != nil {
-		log.Fatal(err)
+		log.Println(err)
 		return err
 	}
 
-	// buf := httputil.BufferPool.Get()
-	// io.CopyBuffer(file, reader, buf)
-	// httputil.BufferPool.Put(buf)
 	if _, err := io.Copy(file, r); err != nil {
-		log.Fatal(err)
+		log.Println("Saving To File:", err)
 		return err
 	}
 	return nil
@@ -98,25 +111,78 @@ type CacheWriter struct {
 	bStore BinaryStore
 }
 
+func (cw CacheWriter) Save(contentType string, url url.URL, bodyReader io.ReadCloser) {
+	retrievalPath := UrlToRetrievalPath(url)
+	log.Println("Now Caching", contentType, url.Path, retrievalPath)
+
+	metadata := Metadata{
+		ContentType: contentType,
+		RetrievalPath: retrievalPath,
+	}
+	cw.mdStore.Set(url.Path, metadata)
+	cw.bStore.Set(retrievalPath, bodyReader)
+}
+
+func (cw CacheWriter) Exists(url url.URL) (bool, error) {
+	exists, err := cw.mdStore.Exists(url.Path)
+	return exists, err
+}
+
 // MultiWriterTransport wraps a transport and writes to a separate writer.
 type MultiWriterTransport struct {
 	TransportDelegate http.RoundTripper
-	Writer CacheWriter
+	CacheWriter CacheWriter
 }
 
-func NewMultiWriterTransport(Writer CacheWriter) *MultiWriterTransport {
+func NewMultiWriterTransport(cw CacheWriter) *MultiWriterTransport {
 	return &MultiWriterTransport{
 		TransportDelegate: http.DefaultTransport,
-		Writer: Writer,
+		CacheWriter: cw,
+	}
+}
+
+func copyResponse(src *http.Response, body io.ReadCloser) *http.Response {
+	headerPtr := &src.Header
+	transferEncodingPtr := &src.TransferEncoding
+	trailerPtr := &src.Trailer
+
+	return &http.Response{
+		Status: src.Status,
+		StatusCode: src.StatusCode,
+		Proto: src.Proto,
+		ProtoMajor: src.ProtoMajor,
+		ProtoMinor: src.ProtoMinor,
+		Header: *headerPtr,
+		Body: body,
+		ContentLength: src.ContentLength,
+		TransferEncoding: *transferEncodingPtr,
+		Close: false,
+		Trailer: *trailerPtr,
+		Request: src.Request,
+		TLS: src.TLS,
 	}
 }
 
 func (mwt MultiWriterTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	response, error := mwt.TransportDelegate.RoundTrip(request)
-	// magic happens here
-	// originalReader := response.Body // io.ReadCloser
 
-	return response, error
+	cacheBodyReader, cacheBodyWriter := io.Pipe()
+	responseReader, responseWriter := io.Pipe()
+	multiWriter := io.MultiWriter(responseWriter, cacheBodyWriter)
+
+	go func() {
+		io.CopyBuffer(multiWriter, response.Body, nil)
+		response.Body.Close()
+		responseWriter.Close()
+		cacheBodyWriter.Close()
+	}()
+
+	go func() {
+		mwt.CacheWriter.Save(response.Header.Get("Content-Type"), *response.Request.URL, cacheBodyReader)
+	}()
+
+	newResponse := copyResponse(response, responseReader)
+	return newResponse, error
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -129,8 +195,7 @@ type CachingProxy struct {
 func NewCachingProxy(target string, cacheWriter CacheWriter) *CachingProxy {
 	url, _ := url.Parse(target)
 	proxy := httputil.NewSingleHostReverseProxy(url)
-	proxy.Transport = MultiWriterTransport{}
-
+	proxy.Transport = NewMultiWriterTransport(cacheWriter)
 	return &CachingProxy{
 		target: url,
 		proxy: proxy,
@@ -139,21 +204,27 @@ func NewCachingProxy(target string, cacheWriter CacheWriter) *CachingProxy {
 }
 
 func (p *CachingProxy) handle(w http.ResponseWriter, r *http.Request) {
-	// if p.cache.Get("key")
-	p.proxy.ServeHTTP(w, r)
+	exists, _ := p.cache.Exists(*r.URL)
+	if exists {
+		path := r.URL.Path
+		metadata, _ := p.cache.mdStore.Get(path)
+
+		file, size, _ := p.cache.bStore.Get(metadata.RetrievalPath)
+
+		w.Header().Set("Content-Type", metadata.ContentType)
+		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		n, err := io.CopyBuffer(w, file, nil)
+		if err != nil {
+			log.Println("Unable to write image.", err)
+		} else if n > 0 {
+			log.Println("Served", n, "bytes from cache.")
+		}
+	} else {
+		p.proxy.ServeHTTP(w, r)
+	}
 }
 
 /////////////////////////////////////////////////////
-	/*
-Serve an image:
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "image/jpeg")
-		w.Header().Set("Content-Length", strconv.Itoa(len(bytes)))
-		if _, err := w.Write(bytes); err != nil {
-			log.Println("unable to write image.")
-		}
-	}
-	*/
 
 
 func main() {
@@ -170,6 +241,6 @@ func main() {
 	fmt.Println("Listening on port 8888...")
 	p := NewCachingProxy("http://localhost:8081", CacheWriter{redisStore, fileStore})
 
-	http.ListenAndServe(":8888", p.proxy)
+	http.ListenAndServe(":8888", http.HandlerFunc(p.handle))
 }
 
