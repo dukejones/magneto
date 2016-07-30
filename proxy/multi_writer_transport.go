@@ -9,14 +9,41 @@ import (
 // MultiWriterTransport wraps a transport and writes to a separate writer.
 type MultiWriterTransport struct {
 	TransportDelegate http.RoundTripper
-	CacheWriter cache.CacheWriter
+	CacheStore cache.CacheStore
 }
 
-func NewMultiWriterTransport(cw cache.CacheWriter) *MultiWriterTransport {
+func NewMultiWriterTransport(cs cache.CacheStore) *MultiWriterTransport {
 	return &MultiWriterTransport{
 		TransportDelegate: http.DefaultTransport,
-		CacheWriter: cw,
+		CacheStore: cs,
 	}
+}
+
+func (mwt MultiWriterTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, error := mwt.TransportDelegate.RoundTrip(request)
+
+	cacheBodyReader, cacheBodyWriter := io.Pipe()
+	responseReader, responseWriter := io.Pipe()
+	multiWriter := io.MultiWriter(responseWriter, cacheBodyWriter)
+
+	go func() {
+		defer response.Body.Close()
+		defer responseWriter.Close()
+		defer cacheBodyWriter.Close()
+		io.CopyBuffer(multiWriter, response.Body, nil)
+	}()
+
+	go func() {
+		url := *response.Request.URL
+		metadata := cache.Metadata{
+			ContentType: response.Header.Get("Content-Type"),
+			Size: response.ContentLength, //response.Header.Get("Content-Length"),
+		}
+		mwt.CacheStore.Set(url.Path, &metadata, cacheBodyReader)
+	}()
+
+	newResponse := copyResponse(response, responseReader)
+	return newResponse, error
 }
 
 func copyResponse(src *http.Response, body io.ReadCloser) *http.Response {
@@ -39,26 +66,4 @@ func copyResponse(src *http.Response, body io.ReadCloser) *http.Response {
 		Request: src.Request,
 		TLS: src.TLS,
 	}
-}
-
-func (mwt MultiWriterTransport) RoundTrip(request *http.Request) (*http.Response, error) {
-	response, error := mwt.TransportDelegate.RoundTrip(request)
-
-	cacheBodyReader, cacheBodyWriter := io.Pipe()
-	responseReader, responseWriter := io.Pipe()
-	multiWriter := io.MultiWriter(responseWriter, cacheBodyWriter)
-
-	go func() {
-		io.CopyBuffer(multiWriter, response.Body, nil)
-		response.Body.Close()
-		responseWriter.Close()
-		cacheBodyWriter.Close()
-	}()
-
-	go func() {
-		mwt.CacheWriter.Save(response.Header.Get("Content-Type"), *response.Request.URL, cacheBodyReader)
-	}()
-
-	newResponse := copyResponse(response, responseReader)
-	return newResponse, error
 }

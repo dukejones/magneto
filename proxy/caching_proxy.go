@@ -10,41 +10,51 @@ import (
 	"github.com/dukejones/magneto/cache"
 )
 
+const (
+	BlockSize = 4096
+)
+
 type CachingProxy struct {
 	target *url.URL
-	proxy *httputil.ReverseProxy
-	cache cache.CacheWriter
+	delegate *httputil.ReverseProxy
+	cache cache.CacheStore
 }
 
-func New(target string, cacheWriter cache.CacheWriter) *CachingProxy {
+func New(target string, cacheStore cache.CacheStore) *CachingProxy {
 	url, _ := url.Parse(target)
 	proxy := httputil.NewSingleHostReverseProxy(url)
-	proxy.Transport = NewMultiWriterTransport(cacheWriter)
+	proxy.Transport = NewMultiWriterTransport(cacheStore)
 	return &CachingProxy{
 		target: url,
-		proxy: proxy,
-		cache: cacheWriter,
+		delegate: proxy,
+		cache: cacheStore,
 	}
 }
 
-func (p *CachingProxy) Handler(w http.ResponseWriter, r *http.Request) {
-	exists, _ := p.cache.Exists(*r.URL)
-	if exists {
-		path := r.URL.Path
-		metadata, _ := p.cache.MetadataStore.Get(path)
-
-		file, size, _ := p.cache.BinaryStore.Get(metadata.RetrievalPath)
-
+func (proxy *CachingProxy) Handler(w http.ResponseWriter, req *http.Request) {
+	metadata, r, err := proxy.cache.Get(req.URL.Path)
+	if err != nil {
+		log.Println("Error retrieving from cache:", err)
+	}
+	tooSmall := (metadata != nil && metadata.Size < BlockSize)
+	log.Println("tooSmall", tooSmall)
+	if metadata != nil {
+		log.Println(strconv.FormatInt(metadata.Size, 10))
+	}
+	if r == nil || metadata == nil || tooSmall {
+		if !tooSmall {
+			log.Println(req.URL.Path, "not found in cache.")
+		}
+		proxy.delegate.ServeHTTP(w, req)
+	} else {
 		w.Header().Set("Content-Type", metadata.ContentType)
-		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-		n, err := io.CopyBuffer(w, file, nil)
+		w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
+		n, err := io.CopyBuffer(w, r, nil)
 		if err != nil {
-			log.Println("Unable to write image.", err)
+			log.Println("Unable to serve image:", err)
 		} else if n > 0 {
 			log.Println("Served", n, "bytes from cache.")
 		}
-	} else {
-		p.proxy.ServeHTTP(w, r)
 	}
 }
 
