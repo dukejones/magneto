@@ -2,7 +2,6 @@ package cache
 
 import (
 	"gopkg.in/redis.v4"
-	"fmt"
 )
 
 // TODO: this implements MetadataStore, rename it to reflect this.
