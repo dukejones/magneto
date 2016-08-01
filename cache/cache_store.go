@@ -9,15 +9,7 @@ import (
 // on what BinaryStore is being used.
 type Metadata struct {
 	ContentType string
-	Size int64
-}
-
-func (md *Metadata) toMap() *map[string]string {
-	return &map[string]string{
-		"ContentType": md.ContentType,
-		"Size": string(md.Size),
-	}
-
+	Size uint
 }
 
 type MetadataStore interface {

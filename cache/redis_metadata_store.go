@@ -2,6 +2,7 @@ package cache
 
 import (
 	"gopkg.in/redis.v4"
+	"strconv"
 )
 
 // TODO: this implements MetadataStore, rename it to reflect this.
@@ -15,15 +16,15 @@ func (rms *RedisMetadataStore) Get(key string) (*Metadata, error) {
 		return nil, err
 	}
 
-	contentType, ok1 := val[0].(string)
-	size, ok2 := val[1].(int64)
-	if !ok1 || !ok2 {
-		return nil, nil
-	}
-	return &Metadata{contentType, size}, nil
+	contentType := val[0].(string)
+	size, _ := strconv.ParseUint(val[1].(string), 10, 32)
+	return &Metadata{contentType, uint(size)}, nil
 }
 
 func (rms *RedisMetadataStore) Set(key string, metadata *Metadata) error {
-	metaMap := metadata.toMap()
-	return rms.Client.HMSet(key, *metaMap).Err()
+	metaMap := map[string]string{
+		"ContentType": metadata.ContentType,
+		"Size": strconv.FormatUint(uint64(metadata.Size), 10),
+	}
+	return rms.Client.HMSet(key, metaMap).Err()
 }
