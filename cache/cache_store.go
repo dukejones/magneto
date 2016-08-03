@@ -9,7 +9,7 @@ import (
 // on what BinaryStore is being used.
 type Metadata struct {
 	ContentType string
-	Size uint
+	Size int64
 }
 
 type MetadataStore interface {

@@ -24,3 +24,23 @@ func TestSet(t *testing.T) {
 	}
 	redisClient.FlushDb()
 }
+
+func TestSetNonNumericSize(t *testing.T) {
+	redisClient := redis.NewClient(&redis.Options{Addr: "localhost:6379", Password: "", DB: 13}) 
+	subject := RedisMetadataStore{redisClient}
+	
+	redisClient.HMSet("key", map[string]string{
+		"ContentType": "text/html",
+		"Size": "notanumber",
+	})
+
+	metadata, err := subject.Get("key")
+	if  err != nil {
+		t.Fatal("Cannot retrieve Redis key")
+	}
+	t.Log("Metadata retrieved:", metadata, err)
+	if metadata.Size != largeSize || metadata.ContentType != "text/html" {
+		t.Error("Wrong Metadata retrieved:", metadata)
+	}
+	redisClient.FlushDb()
+}

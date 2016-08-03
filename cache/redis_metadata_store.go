@@ -17,14 +17,14 @@ func (rms *RedisMetadataStore) Get(key string) (*Metadata, error) {
 	}
 
 	contentType := val[0].(string)
-	size, _ := strconv.ParseUint(val[1].(string), 10, 32)
-	return &Metadata{contentType, uint(size)}, nil
+	size, _ := strconv.ParseInt(val[1].(string), 10, 64)
+	return &Metadata{contentType, size}, nil
 }
 
 func (rms *RedisMetadataStore) Set(key string, metadata *Metadata) error {
 	metaMap := map[string]string{
 		"ContentType": metadata.ContentType,
-		"Size": strconv.FormatUint(uint64(metadata.Size), 10),
+		"Size": strconv.FormatInt(metadata.Size, 10),
 	}
 	return rms.Client.HMSet(key, metaMap).Err()
 }
